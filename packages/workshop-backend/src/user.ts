@@ -1,5 +1,5 @@
 import { RpcStub } from "capnweb";
-import { GadgetMetadataWithTimestamps, AiChatAuthorInfo, AiModelConfig, SUGGESTED_MODELS, CollaboratorRole, ConnectedAccountsSubscriber, ConnectedAccountsFilter, GatekeeperVendorFilter, GadgetMetadata, BlueprintMetadata, BlueprintLibrarySummary, BlueprintSource, BlueprintUserSummary, BLUEPRINT_SCREENSHOT_R2_PREFIX, GatekeeperVendorInfo, BlueprintOutput, OutputSummary, WorkpieceId, ListOutputsResult, ConnectedAccountHealth } from '@gadgets/workshop-shared/api';
+import { GadgetMetadataWithTimestamps, AiChatAuthorInfo, AiModelConfig, SUGGESTED_MODELS, CollaboratorRole, ConnectedAccountsSubscriber, ConnectedAccountsFilter, GatekeeperVendorFilter, GadgetMetadata, BlueprintMetadata, BlueprintLibrarySummary, BlueprintSource, BlueprintUserSummary, BLUEPRINT_SCREENSHOT_R2_PREFIX, GatekeeperVendorInfo, BlueprintOutput, OutputSummary, WorkpieceId, ListOutputsResult, ConnectedAccountHealth, ConnectedAccountVendorHealth } from '@gadgets/workshop-shared/api';
 import { Gatekeeper, GatekeeperUser, GatekeeperUserVerifier, GatekeeperVendor, AccountDescription, VendorDescription, GatekeeperConnectCallback, SupportedResource, ResourceConfiguratorFrame, AppUiContext, GatekeeperUiFrame } from "@gadgets/workshop-shared/gatekeeper";
 import { shouldAutoProvisionAccount, ambientGatekeeperMode } from "./provisioning-policy.js";
 import { CloudflareGatekeeperUser } from "@gadgets/workshop-shared/cloudflare-gatekeeper";
@@ -85,6 +85,33 @@ export function summarizeConnectedAccountHealth(
       throw new Error("Connected-account health exceeds the supported limit");
     }
     if (areCredentialsValid(record)) valid++;
+  }
+  return { total, valid, reconnectRequired: total - valid };
+}
+
+/** Summarize one vendor's credential health without retaining account or vendor metadata. */
+export function summarizeConnectedAccountVendorHealth(
+    vendorId: string,
+    records: Iterable<ConnectedAccountRecord>,
+): ConnectedAccountVendorHealth {
+  let total = 0;
+  let valid = 0;
+  let scanned = 0;
+  for (let record of records) {
+    scanned++;
+    if (scanned > CONNECTED_ACCOUNT_HEALTH_MAX) {
+      throw new Error("Connected-account health exceeds the supported limit");
+    }
+    if (typeof record?.vendorId !== "string") {
+      throw new Error("Connected-account vendor state is malformed");
+    }
+
+    // Validate every persisted credential state in the bounded snapshot, including records for
+    // other vendors, so malformed storage cannot be hidden by the requested vendor filter.
+    let credentialsValid = areCredentialsValid(record);
+    if (record.vendorId !== vendorId) continue;
+    total++;
+    if (credentialsValid) valid++;
   }
   return { total, valid, reconnectRequired: total - valid };
 }
@@ -1377,6 +1404,23 @@ export class UserDurableObject extends DurableObject<Cloudflare.Env> {
         event: "connected.account.health.failed", error: err,
       });
       throw new Error("Connected-account health unavailable", {cause: err});
+    }
+  }
+
+  // Return one configured vendor's aggregate health without exposing connected-account metadata.
+  // The scan remains unary and bounded; malformed persistence or an unknown vendor fails closed.
+  async getConnectedAccountVendorHealth(vendorId: string): Promise<ConnectedAccountVendorHealth> {
+    if (typeof vendorId !== "string" || vendorId.length === 0 || !this.vendors.has(vendorId)) {
+      throw new Error("Invalid connected-account vendor.");
+    }
+    try {
+      return summarizeConnectedAccountVendorHealth(
+          vendorId, this.storage.connectedAccounts.list({limit: CONNECTED_ACCOUNT_HEALTH_MAX + 1}));
+    } catch (err) {
+      logger.error("connected-account vendor health unavailable", {
+        event: "connected.account.vendor.health.failed", error: err,
+      });
+      throw new Error("Connected-account vendor health unavailable", {cause: err});
     }
   }
 
