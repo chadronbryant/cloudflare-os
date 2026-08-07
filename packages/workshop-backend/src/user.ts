@@ -19,6 +19,11 @@ const logger = createWorkshopLogger("workshop.user");
 // listOutputs() call wakes and how long it waits. The client calls again until catch-up is done.
 const OUTPUTS_BACKFILL_PAGE = 16;
 
+// Home receives this as an operator-health projection, so a single request must never scan or
+// materialize an unbounded account collection. The +1 probe distinguishes exactly-at-limit from
+// over-limit without exposing any account metadata.
+export const CONNECTED_ACCOUNT_HEALTH_MAX = 100;
+
 type ConnectedAccountRecord = {
   id: number;
   account: Fetcher<GatekeeperUser>;
@@ -55,8 +60,16 @@ type SingletonAccountStub = Required<Pick<GatekeeperUser, "getSingletonGatekeepe
 type ConnectedAccountCredentialState = Pick<ConnectedAccountRecord, "credentialsExpired" | "credentialExpiresAt">;
 
 function areCredentialsValid(record: ConnectedAccountCredentialState): boolean {
+  if (record.credentialsExpired !== undefined && typeof record.credentialsExpired !== "boolean") {
+    throw new Error("Connected-account credential state is malformed");
+  }
+  if (record.credentialExpiresAt !== undefined) {
+    if (!(record.credentialExpiresAt instanceof Date) || !Number.isFinite(record.credentialExpiresAt.valueOf())) {
+      throw new Error("Connected-account credential expiry is malformed");
+    }
+    if (record.credentialExpiresAt.valueOf() < Date.now()) return false;
+  }
   if (record.credentialsExpired) return false;
-  if (record.credentialExpiresAt && record.credentialExpiresAt.valueOf() < Date.now()) return false;
   return true;
 }
 
@@ -68,6 +81,9 @@ export function summarizeConnectedAccountHealth(
   let valid = 0;
   for (let record of records) {
     total++;
+    if (total > CONNECTED_ACCOUNT_HEALTH_MAX) {
+      throw new Error("Connected-account health exceeds the supported limit");
+    }
     if (areCredentialsValid(record)) valid++;
   }
   return { total, valid, reconnectRequired: total - valid };
@@ -1349,9 +1365,19 @@ export class UserDurableObject extends DurableObject<Cloudflare.Env> {
 
   // Return aggregate health without loading vendor descriptions or exposing account metadata.
   // This is intentionally unary: the Home HTTP batch transport cannot prove disposal of a
-  // callback subscription after the response closes.
+  // callback subscription after the response closes. Unlike the resilient listing/subscription
+  // iterator, this health-specific scan is fail-closed: a storage/deserialization error or more
+  // than the supported number of records rejects the RPC rather than reporting partial health.
   async getConnectedAccountHealth(): Promise<ConnectedAccountHealth> {
-    return summarizeConnectedAccountHealth(this.#connectedAccountRecords());
+    try {
+      return summarizeConnectedAccountHealth(
+          this.storage.connectedAccounts.list({limit: CONNECTED_ACCOUNT_HEALTH_MAX + 1}));
+    } catch (err) {
+      logger.error("connected-account health unavailable", {
+        event: "connected.account.health.failed", error: err,
+      });
+      throw new Error("Connected-account health unavailable", {cause: err});
+    }
   }
 
   async subscribeConnectedAccounts(
