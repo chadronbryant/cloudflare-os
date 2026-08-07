@@ -352,6 +352,9 @@ export interface AuthenticatedApi extends RpcTarget {
   // is done via the Cloudflare gatekeeper (connectAccount("cloudflare")) or by signing in with it.
   listCloudflareAccounts(): Promise<CloudflareAccountOption[]>;
 
+  // Return aggregate connected-account health without exposing account identifiers or metadata.
+  getConnectedAccountHealth(): Promise<ConnectedAccountHealth>;
+
   // Select which Cloudflare account to bill. Persists the choice. Throws if the account isn't
   // accessible.
   selectCloudflareAccount(accountId: string): Promise<void>;
@@ -914,6 +917,14 @@ export type CloudflareUsageInfo = {
 export type CloudflareAccountOption = {
   accountId: string;
   accountName: string;
+};
+
+// Aggregate connected-account health for read-only operator surfaces. This deliberately omits
+// account identifiers, vendor metadata, grants, resources, and management UI details.
+export type ConnectedAccountHealth = {
+  total: number;
+  valid: number;
+  reconnectRequired: number;
 };
 
 // Supported AI providers.

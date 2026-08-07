@@ -1,5 +1,5 @@
 import { RpcStub } from "capnweb";
-import { GadgetMetadataWithTimestamps, AiChatAuthorInfo, AiModelConfig, SUGGESTED_MODELS, CollaboratorRole, ConnectedAccountsSubscriber, ConnectedAccountsFilter, GatekeeperVendorFilter, GadgetMetadata, BlueprintMetadata, BlueprintLibrarySummary, BlueprintSource, BlueprintUserSummary, BLUEPRINT_SCREENSHOT_R2_PREFIX, GatekeeperVendorInfo, BlueprintOutput, OutputSummary, WorkpieceId, ListOutputsResult } from '@gadgets/workshop-shared/api';
+import { GadgetMetadataWithTimestamps, AiChatAuthorInfo, AiModelConfig, SUGGESTED_MODELS, CollaboratorRole, ConnectedAccountsSubscriber, ConnectedAccountsFilter, GatekeeperVendorFilter, GadgetMetadata, BlueprintMetadata, BlueprintLibrarySummary, BlueprintSource, BlueprintUserSummary, BLUEPRINT_SCREENSHOT_R2_PREFIX, GatekeeperVendorInfo, BlueprintOutput, OutputSummary, WorkpieceId, ListOutputsResult, ConnectedAccountHealth } from '@gadgets/workshop-shared/api';
 import { Gatekeeper, GatekeeperUser, GatekeeperUserVerifier, GatekeeperVendor, AccountDescription, VendorDescription, GatekeeperConnectCallback, SupportedResource, ResourceConfiguratorFrame, AppUiContext, GatekeeperUiFrame } from "@gadgets/workshop-shared/gatekeeper";
 import { shouldAutoProvisionAccount, ambientGatekeeperMode } from "./provisioning-policy.js";
 import { CloudflareGatekeeperUser } from "@gadgets/workshop-shared/cloudflare-gatekeeper";
@@ -52,10 +52,25 @@ export type ProvidedAccountInfo = {
 type AccountCreatorStub = Required<Pick<GatekeeperVendor, "createAccount">>;
 type SingletonAccountStub = Required<Pick<GatekeeperUser, "getSingletonGatekeeperClass" | "startAppUi">>;
 
-function areCredentialsValid(record: ConnectedAccountRecord): boolean {
+type ConnectedAccountCredentialState = Pick<ConnectedAccountRecord, "credentialsExpired" | "credentialExpiresAt">;
+
+function areCredentialsValid(record: ConnectedAccountCredentialState): boolean {
   if (record.credentialsExpired) return false;
   if (record.credentialExpiresAt && record.credentialExpiresAt.valueOf() < Date.now()) return false;
   return true;
+}
+
+/** Summarize credential health without retaining connected-account identity or vendor metadata. */
+export function summarizeConnectedAccountHealth(
+    records: Iterable<ConnectedAccountCredentialState>,
+): ConnectedAccountHealth {
+  let total = 0;
+  let valid = 0;
+  for (let record of records) {
+    total++;
+    if (areCredentialsValid(record)) valid++;
+  }
+  return { total, valid, reconnectRequired: total - valid };
 }
 
 // Vendor id of the Cloudflare gatekeeper (the suffix of GATEKEEPER_CLOUDFLARE, lowercased). The AI
@@ -1330,6 +1345,13 @@ export class UserDurableObject extends DurableObject<Cloudflare.Env> {
     let record = this.storage.connectedAccounts.get(accountId);
     if (!record) throw new Error("No such account.");
     return record.account.ensureResources(resourceUrlPatterns);
+  }
+
+  // Return aggregate health without loading vendor descriptions or exposing account metadata.
+  // This is intentionally unary: the Home HTTP batch transport cannot prove disposal of a
+  // callback subscription after the response closes.
+  async getConnectedAccountHealth(): Promise<ConnectedAccountHealth> {
+    return summarizeConnectedAccountHealth(this.#connectedAccountRecords());
   }
 
   async subscribeConnectedAccounts(
